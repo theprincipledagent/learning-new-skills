@@ -114,16 +114,21 @@ class ActorManager:
         if self.config.oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = self.config.oauth_token
 
-        # Build command
-        cmd = (
-            f'claude -p "$(cat /work/prompt.txt)" '
-            f"--model {self.config.model} "
-            f"--output-format stream-json "
-            f"--append-system-prompt-file /work/system_prompt.txt "
+        # Write a shell script to avoid docker-py shlex.split issues
+        script = (
+            '#!/bin/bash\n'
+            'claude -p "$(cat /work/prompt.txt)" '
+            f'--model {self.config.model} '
+            f'--verbose '
+            f'--output-format stream-json '
+            f'--append-system-prompt-file /work/system_prompt.txt '
             f'--allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch" '
-            f"--max-turns {self.config.max_actor_turns} "
-            f"--dangerously-skip-permissions"
+            f'--max-turns {self.config.max_actor_turns} '
+            f'--dangerously-skip-permissions\n'
         )
+        script_path = work_dir / "run.sh"
+        script_path.write_text(script)
+        script_path.chmod(0o755)
 
         volumes = {
             str(work_dir.resolve()): {"bind": "/work", "mode": "rw"},
@@ -133,18 +138,20 @@ class ActorManager:
             },
         }
 
-        exit_code, stdout = self.docker.run_container(
+        # Pass as list so docker-py doesn't shlex.split it
+        exit_code, stdout, stderr = self.docker.run_container(
             image=self.config.actor_image,
-            command=cmd,
+            command=["/work/run.sh"],
             env=env,
             volumes=volumes,
             timeout=self.config.actor_timeout_seconds,
         )
 
-        # Parse stream-json output
-        transcript_raw = stdout
-        transcript_formatted = self._format_transcript(stdout)
-        final_answer = self._extract_answer(stdout)
+        # Claude Code may write to stdout or stderr; combine for parsing
+        combined_output = stdout + "\n" + stderr
+        transcript_raw = combined_output
+        transcript_formatted = self._format_transcript(combined_output)
+        final_answer = self._extract_answer(combined_output)
         is_correct = check_answer(final_answer, question.final_answer)
 
         # Save rollout

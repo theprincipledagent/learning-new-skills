@@ -3,6 +3,13 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Claude Code CLI accepts short names; the API needs full model IDs
+MODEL_API_IDS = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-5-20250929",
+    "opus": "claude-opus-4-6",
+}
+
 
 @dataclass
 class Config:
@@ -43,6 +50,11 @@ class Config:
         d = self.epoch_dir(epoch) / "rollouts"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    @property
+    def api_model(self) -> str:
+        """Full model ID for the Anthropic API."""
+        return MODEL_API_IDS.get(self.model, self.model)
 
     def validate(self) -> None:
         if not self.api_key and not self.oauth_token:

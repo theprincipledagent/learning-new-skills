@@ -75,7 +75,7 @@ class EvaluatorManager:
             requests.append({
                 "id": rollout.task_id,
                 "messages": [{"role": "user", "content": user_content}],
-                "model": "claude-haiku-4-5-20251001",
+                "model": self.config.api_model,
                 "max_tokens": 2048,
             })
 

@@ -23,26 +23,13 @@ class Skill:
             f"description: {self.description}",
             "instructions:",
         ]
-        # Interleave instructions with their evolution notes
-        for instruction in self.instructions:
-            # Check if instruction has an associated evolution note
-            note = None
-            for en in self.evolution_notes:
-                if en in instruction or instruction in en:
-                    note = en
-                    break
-            if note and not instruction.startswith("#"):
-                lines.append(f"  # {note}")
+        # Ensure all instructions are strings
+        str_instructions = [str(i) if not isinstance(i, str) else i for i in self.instructions]
+        for instruction in str_instructions:
             lines.append(f"  - {_yaml_quote(instruction)}")
-        # Append any remaining evolution notes not associated with instructions
-        used_notes = set()
-        for instruction in self.instructions:
-            for en in self.evolution_notes:
-                if en in instruction or instruction in en:
-                    used_notes.add(en)
+        # Append evolution notes as trailing comments
         for en in self.evolution_notes:
-            if en not in used_notes:
-                lines.append(f"  # {en}")
+            lines.append(f"  # {en}")
         return "\n".join(lines) + "\n"
 
     def to_yaml_stripped(self) -> str:
@@ -104,11 +91,14 @@ class SkillManager:
         if not isinstance(data, dict):
             return None
 
+        raw_instructions = data.get("instructions", [])
+        instructions = [str(i) if not isinstance(i, str) else i for i in raw_instructions]
+
         return Skill(
             filename=path.name,
             name=data.get("name", path.stem),
             description=data.get("description", ""),
-            instructions=data.get("instructions", []),
+            instructions=instructions,
             evolution_notes=evolution_notes,
         )
 
@@ -171,7 +161,7 @@ def apply_trust_region(
 
         ratio = 1.0 - SequenceMatcher(None, old_yaml, new_yaml).ratio()
 
-        if ratio <= threshold:
+        if ratio < threshold:
             accepted[filename] = new_skill
         else:
             rejections.append(

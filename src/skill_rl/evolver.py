@@ -60,7 +60,7 @@ class EvolverManager:
             "requests": [{
                 "id": f"evolve_epoch_{epoch}",
                 "messages": [{"role": "user", "content": user_content}],
-                "model": "claude-sonnet-4-5-20250929",
+                "model": self.config.api_model,
                 "max_tokens": 8192,
             }],
         }
@@ -167,11 +167,14 @@ class EvolverManager:
         if not isinstance(data, dict):
             return None
 
+        raw_instructions = data.get("instructions", [])
+        instructions = [str(i) if not isinstance(i, str) else i for i in raw_instructions]
+
         return Skill(
             filename=filename,
             name=data.get("name", filename.replace(".yaml", "")),
             description=data.get("description", ""),
-            instructions=data.get("instructions", []),
+            instructions=instructions,
             evolution_notes=evolution_notes,
         )
 

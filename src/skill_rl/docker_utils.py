@@ -41,14 +41,14 @@ class DockerManager:
     def run_container(
         self,
         image: str,
-        command: str,
+        command: str | list[str],
         env: dict[str, str] | None = None,
         volumes: dict[str, dict] | None = None,
         timeout: int = 600,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, str]:
         """Run a container to completion. Always cleans up.
 
-        Returns (exit_code, stdout).
+        Returns (exit_code, stdout, stderr).
         """
         container = None
         try:
@@ -67,7 +67,7 @@ class DockerManager:
             stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
             if stderr:
                 print(f"  Container stderr: {stderr[:2000]}")
-            return exit_code, stdout
+            return exit_code, stdout, stderr
         except Exception as e:
             if container:
                 try:
@@ -110,7 +110,7 @@ class DockerManager:
                 "mode": "ro",
             }
 
-        exit_code, stdout = self.run_container(
+        exit_code, stdout, stderr = self.run_container(
             image=image,
             command="",  # Uses default entrypoint
             env=env,
