@@ -50,6 +50,10 @@ def parse_args() -> Config:
     parser.add_argument("--llm-image", type=str,
                         default="skill-rl-llm:latest")
 
+    # Evaluation mode
+    parser.add_argument("--use-benchmark-score", action="store_true",
+                        help="Use ground truth to diagnose failures instead of blind evaluation")
+
     # Resume
     parser.add_argument("--start-epoch", type=int, default=0,
                         help="Epoch to resume from")
@@ -72,6 +76,7 @@ def parse_args() -> Config:
         prompts_dir=args.prompts_dir,
         actor_image=args.actor_image,
         llm_image=args.llm_image,
+        use_benchmark_score=args.use_benchmark_score,
         start_epoch=args.start_epoch,
     )
 
@@ -91,10 +96,10 @@ def main():
     metrics_tracker = MetricsTracker(config.data_dir)
 
     actor_mgr = ActorManager(config, docker_mgr)
-    evaluator_mgr = EvaluatorManager(config, docker_mgr)
-    evolver_mgr = EvolverManager(config, docker_mgr)
+    evaluator_mgr = EvaluatorManager(config)
+    evolver_mgr = EvolverManager(config)
 
-    # Build Docker images
+    # Build Docker images (only actor image needed)
     print("Building Docker images...")
     docker_mgr.ensure_images(
         actor_image=config.actor_image,

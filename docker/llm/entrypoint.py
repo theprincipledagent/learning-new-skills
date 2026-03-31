@@ -80,7 +80,12 @@ def main():
     input_data = load_input()
     requests = input_data["requests"]
 
-    client = anthropic.Anthropic()  # Uses ANTHROPIC_API_KEY env var
+    # Support both API key and OAuth token auth
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if auth_token:
+        client = anthropic.Anthropic(auth_token=auth_token)
+    else:
+        client = anthropic.Anthropic()  # Uses ANTHROPIC_API_KEY env var
 
     responses = []
     for i, req in enumerate(requests):

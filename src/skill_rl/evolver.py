@@ -2,20 +2,34 @@
 
 import json
 import math
+import re
 from pathlib import Path
 
 import yaml
 
 from .config import Config
-from .docker_utils import DockerManager
-from .evaluator import EvaluationResult
+from .evaluator import EvaluationResult, call_claude_cli
 from .skills import Skill, SkillManager, apply_trust_region
 
 
+SKILL_FORMAT_EXAMPLE = """---
+name: research-methodology
+description: Systematic approach to answering research questions using available tools
+---
+
+When researching a question, follow these steps:
+
+1. **Identify the question type**: Determine if it requires file analysis, web research, computation, or a combination
+2. **Locate resources first**: Use Glob and Read to find any attached files before asking the user
+3. **Verify your sources**: Cross-reference findings from multiple sources when possible
+
+Keep your approach systematic and always show your work.
+"""
+
+
 class EvolverManager:
-    def __init__(self, config: Config, docker_mgr: DockerManager):
+    def __init__(self, config: Config):
         self.config = config
-        self.docker = docker_mgr
 
     def evolve_skills(
         self,
@@ -25,8 +39,6 @@ class EvolverManager:
     ) -> None:
         """Evolve skills based on worst-performing evaluations."""
         epoch_dir = self.config.epoch_dir(epoch)
-        work_dir = epoch_dir / "evolver_work"
-        work_dir.mkdir(parents=True, exist_ok=True)
 
         # Select bottom percentile
         sorted_evals = sorted(evaluations, key=lambda e: e.overall_score)
@@ -50,50 +62,44 @@ class EvolverManager:
 
         current_skills = skill_mgr.get_skills_with_notes()
 
-        user_content = json.dumps({
+        data_json = json.dumps({
             "epoch": epoch,
             "evaluations": eval_summaries,
             "current_skills": current_skills,
-        })
+        }, indent=2)
 
-        input_data = {
-            "requests": [{
-                "id": f"evolve_epoch_{epoch}",
-                "messages": [{"role": "user", "content": user_content}],
-                "model": self.config.api_model,
-                "max_tokens": 8192,
-            }],
-        }
-
-        # Run LLM container
-        env = {}
-        if self.config.api_key:
-            env["ANTHROPIC_API_KEY"] = self.config.api_key
-
-        prompt_path = self.config.prompts_dir / "evolver_system.txt"
-
-        output = self.docker.run_container_with_volume_io(
-            image=self.config.llm_image,
-            input_data=input_data,
-            work_dir=work_dir,
-            env=env,
-            timeout=300,
-            prompt_mount=prompt_path,
+        user_content = (
+            "Analyze the following evaluation data and produce evolved skills.\n\n"
+            "IMPORTANT: Respond with ONLY a JSON object, no other text. The JSON must have this structure:\n"
+            '{"skills": {"skill-name": "SKILL.md file content...", ...}, "reasoning": "explanation..."}\n\n'
+            "The key is the skill name (used as folder name). The value is the full SKILL.md content.\n"
+            "Each skill must be a markdown file with YAML frontmatter, like this example:\n"
+            f"```\n{SKILL_FORMAT_EXAMPLE}```\n\n"
+            "The skill body is free-form markdown — use numbered lists, bold text, paragraphs, etc.\n"
+            "The name in the frontmatter MUST match the key in the JSON.\n"
+            "Include ALL skills (modified and unmodified). If no skills exist yet, create 2-3 foundational ones.\n"
+            "Evolution notes should be added as HTML comments: <!-- [EVOLUTION cycle N] note -->\n\n"
+            f"Data:\n{data_json}"
         )
 
-        if not output or "responses" not in output:
-            print("  WARNING: Evolution failed - no output from LLM container")
-            self._save_evolution_record(epoch_dir, epoch, worst_evals, {}, [], "No output")
-            return
+        system_prompt_path = self.config.prompts_dir / "evolver_system.txt"
 
-        resp = output["responses"][0]
-        if resp.get("error"):
-            print(f"  WARNING: Evolution failed - {resp['error']}")
-            self._save_evolution_record(epoch_dir, epoch, worst_evals, {}, [], resp["error"])
+        try:
+            content = call_claude_cli(
+                user_content=user_content,
+                system_prompt_file=str(system_prompt_path),
+                model=self.config.model,
+                config=self.config,
+            )
+        except Exception as e:
+            print(f"  WARNING: Evolution failed - {e}")
+            self._save_evolution_record(
+                epoch_dir, epoch, worst_evals, {}, [], str(e)
+            )
             return
 
         # Parse response
-        content = resp["content"].strip()
+        content = content.strip()
         if content.startswith("```"):
             lines = content.split("\n")
             if lines[0].startswith("```"):
@@ -101,6 +107,9 @@ class EvolverManager:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             content = "\n".join(lines)
+
+        # Save raw response for debugging
+        (epoch_dir / "evolver_raw_response.txt").write_text(content)
 
         try:
             data = json.loads(content)
@@ -113,11 +122,18 @@ class EvolverManager:
             return
 
         # Parse new skills
+        raw_skills = data.get("skills", {})
+        if not raw_skills:
+            print(f"  WARNING: No 'skills' key in response. Keys: {list(data.keys())}")
+            print(f"  Response preview: {content[:500]}")
         new_skills: dict[str, Skill] = {}
-        for filename, yaml_content in data.get("skills", {}).items():
-            skill = self._parse_skill_yaml(filename, yaml_content)
+        for skill_name, file_content in raw_skills.items():
+            skill = self._parse_skill_file(skill_name, file_content)
             if skill:
-                new_skills[filename] = skill
+                new_skills[skill.name] = skill
+            else:
+                print(f"  WARNING: Failed to parse skill {skill_name}")
+                print(f"    Content preview: {str(file_content)[:200]}")
 
         if not new_skills:
             print("  WARNING: Evolution produced no valid skills")
@@ -150,31 +166,48 @@ class EvolverManager:
             epoch_dir, epoch, worst_evals, accepted, rejections, reasoning
         )
 
-    def _parse_skill_yaml(self, filename: str, yaml_content: str) -> Skill | None:
-        """Parse a skill from YAML content."""
-        import re
+    def _parse_skill_file(self, skill_name: str, file_content: str | dict) -> Skill | None:
+        """Parse a skill from SKILL.md file content or a dict."""
+        # Handle case where LLM returns a dict instead of a string
+        if isinstance(file_content, dict):
+            return Skill(
+                name=file_content.get("name", skill_name),
+                description=file_content.get("description", ""),
+                body=str(file_content.get("body", file_content.get("instructions", ""))),
+                evolution_notes=file_content.get("evolution_notes", []),
+            )
 
-        # Extract evolution comments
-        evolution_notes = re.findall(
-            r"#\s*(\[EVOLUTION[^\]]*\][^\n]*)", yaml_content
-        )
+        file_content = str(file_content)
+
+        # Extract evolution notes from HTML comments
+        evolution_notes = re.findall(r"<!--\s*(.*?)\s*-->", file_content)
+
+        # Parse frontmatter
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", file_content, re.DOTALL)
+        if not match:
+            # Lenient — LLM didn't include frontmatter
+            return Skill(
+                name=skill_name,
+                description="",
+                body=file_content.strip(),
+                evolution_notes=evolution_notes,
+            )
 
         try:
-            data = yaml.safe_load(yaml_content)
+            frontmatter = yaml.safe_load(match.group(1))
         except yaml.YAMLError:
             return None
 
-        if not isinstance(data, dict):
+        if not isinstance(frontmatter, dict):
             return None
 
-        raw_instructions = data.get("instructions", [])
-        instructions = [str(i) if not isinstance(i, str) else i for i in raw_instructions]
+        body = match.group(2).strip()
+        clean_body = re.sub(r"\n*<!--\s*.*?\s*-->\n*", "", body).strip()
 
         return Skill(
-            filename=filename,
-            name=data.get("name", filename.replace(".yaml", "")),
-            description=data.get("description", ""),
-            instructions=instructions,
+            name=frontmatter.get("name", skill_name),
+            description=frontmatter.get("description", ""),
+            body=clean_body,
             evolution_notes=evolution_notes,
         )
 

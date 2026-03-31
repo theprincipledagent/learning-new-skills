@@ -38,6 +38,9 @@ class Config:
     actor_image: str = "skill-rl-actor:latest"
     llm_image: str = "skill-rl-llm:latest"
 
+    # Evaluation mode
+    use_benchmark_score: bool = False
+
     # Resume
     start_epoch: int = 0
 

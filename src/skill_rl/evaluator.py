@@ -1,12 +1,14 @@
-"""Evaluator orchestration: scores rollouts using LLM judge."""
+"""Evaluator orchestration: scores rollouts using Claude Code CLI."""
 
 import json
-from dataclasses import dataclass, field
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from .actor import ActorResult
 from .config import Config
-from .docker_utils import DockerManager
 from .skills import SkillManager
 
 
@@ -37,9 +39,8 @@ TRUNCATION_HALF = 50_000
 
 
 class EvaluatorManager:
-    def __init__(self, config: Config, docker_mgr: DockerManager):
+    def __init__(self, config: Config):
         self.config = config
-        self.docker = docker_mgr
 
     def evaluate_rollouts(
         self,
@@ -47,66 +48,17 @@ class EvaluatorManager:
         skill_mgr: SkillManager,
         epoch: int,
     ) -> list[EvaluationResult]:
-        """Evaluate all rollouts via a single LLM container."""
+        """Evaluate all rollouts sequentially via Claude Code CLI."""
         epoch_dir = self.config.epoch_dir(epoch)
-        work_dir = epoch_dir / "evaluator_work"
-        work_dir.mkdir(parents=True, exist_ok=True)
-
         skills_text = skill_mgr._build_skills_block()
 
-        # Build batch of requests
-        requests = []
-        for rollout in rollouts:
-            transcript = rollout.transcript_formatted
-            # Truncate long transcripts
-            if len(transcript) > MAX_TRANSCRIPT_CHARS:
-                transcript = (
-                    transcript[:TRUNCATION_HALF]
-                    + "\n\n... [TRUNCATED] ...\n\n"
-                    + transcript[-TRUNCATION_HALF:]
-                )
-
-            user_content = json.dumps({
-                "question": rollout.question,
-                "transcript": transcript,
-                "skills": skills_text,
-            })
-
-            requests.append({
-                "id": rollout.task_id,
-                "messages": [{"role": "user", "content": user_content}],
-                "model": self.config.api_model,
-                "max_tokens": 2048,
-            })
-
-        input_data = {"requests": requests}
-
-        # Run LLM container
-        env = {}
-        if self.config.api_key:
-            env["ANTHROPIC_API_KEY"] = self.config.api_key
-
-        prompt_path = self.config.prompts_dir / "evaluator_system.txt"
-
-        output = self.docker.run_container_with_volume_io(
-            image=self.config.llm_image,
-            input_data=input_data,
-            work_dir=work_dir,
-            env=env,
-            timeout=600,
-            prompt_mount=prompt_path,
-        )
-
-        # Parse responses
         results = []
-        response_map: dict[str, dict] = {}
-        if output and "responses" in output:
-            for resp in output["responses"]:
-                response_map[resp["id"]] = resp
-
-        for rollout in rollouts:
-            resp = response_map.get(rollout.task_id)
-            eval_result = self._parse_evaluation(rollout, resp)
+        for i, rollout in enumerate(rollouts):
+            print(f"  Evaluating {i + 1}/{len(rollouts)}: {rollout.task_id}")
+            if self.config.use_benchmark_score:
+                eval_result = self._evaluate_single_benchmark(rollout, skills_text)
+            else:
+                eval_result = self._evaluate_single(rollout, skills_text)
             results.append(eval_result)
 
         # Save evaluations
@@ -131,29 +83,101 @@ class EvaluatorManager:
 
         return results
 
-    def _parse_evaluation(
-        self, rollout: ActorResult, resp: dict | None
+    def _evaluate_single(
+        self, rollout: ActorResult, skills_text: str
     ) -> EvaluationResult:
-        """Parse an LLM response into an EvaluationResult."""
-        if not resp or resp.get("error") or not resp.get("content"):
-            return EvaluationResult(
-                task_id=rollout.task_id,
-                question=rollout.question,
-                level=rollout.level,
-                scores=DEFAULT_SCORES.copy(),
-                overall_score=1,
-                feedback="Evaluation failed",
-                improvement_areas=[],
-                final_answer=rollout.final_answer,
-                ground_truth=rollout.ground_truth,
-                is_correct=rollout.is_correct,
+        """Evaluate a single rollout via Claude Code CLI."""
+        transcript = rollout.transcript_formatted
+        if len(transcript) > MAX_TRANSCRIPT_CHARS:
+            transcript = (
+                transcript[:TRUNCATION_HALF]
+                + "\n\n... [TRUNCATED] ...\n\n"
+                + transcript[-TRUNCATION_HALF:]
             )
 
-        content = resp["content"].strip()
+        data_json = json.dumps({
+            "question": rollout.question,
+            "transcript": transcript,
+            "skills": skills_text,
+        }, indent=2)
+
+        user_content = (
+            "Evaluate the following agent rollout.\n\n"
+            "IMPORTANT: Respond with ONLY a JSON object, no other text. The JSON must have this structure:\n"
+            '{"scores": {"helpfulness": N, "accuracy": N, "reasoning_quality": N, "tool_selection": N, "knowledge_application": N}, '
+            '"overall_score": N, "feedback": "...", "improvement_areas": ["..."]}\n\n'
+            f"Data:\n{data_json}"
+        )
+
+        system_prompt_path = self.config.prompts_dir / "evaluator_system.txt"
+
+        try:
+            content = call_claude_cli(
+                user_content=user_content,
+                system_prompt_file=str(system_prompt_path),
+                model=self.config.model,
+                config=self.config,
+            )
+        except Exception as e:
+            print(f"    Evaluation failed: {e}")
+            return self._default_result(rollout, f"CLI error: {e}")
+
+        return self._parse_evaluation(rollout, content)
+
+    def _evaluate_single_benchmark(
+        self, rollout: ActorResult, skills_text: str
+    ) -> EvaluationResult:
+        """Evaluate a single rollout with ground truth knowledge."""
+        transcript = rollout.transcript_formatted
+        if len(transcript) > MAX_TRANSCRIPT_CHARS:
+            transcript = (
+                transcript[:TRUNCATION_HALF]
+                + "\n\n... [TRUNCATED] ...\n\n"
+                + transcript[-TRUNCATION_HALF:]
+            )
+
+        status = "CORRECT" if rollout.is_correct else "WRONG"
+
+        data_json = json.dumps({
+            "question": rollout.question,
+            "transcript": transcript,
+            "skills": skills_text,
+            "is_correct": rollout.is_correct,
+            "ground_truth": rollout.ground_truth,
+            "final_answer": rollout.final_answer,
+        }, indent=2)
+
+        user_content = (
+            f"Diagnose this {status} agent rollout.\n\n"
+            "IMPORTANT: Respond with ONLY a JSON object, no other text. The JSON must have this structure:\n"
+            '{"scores": {"helpfulness": N, "accuracy": N, "reasoning_quality": N, "tool_selection": N, "knowledge_application": N}, '
+            '"overall_score": N, "feedback": "...", "improvement_areas": ["..."]}\n\n'
+            f"Data:\n{data_json}"
+        )
+
+        system_prompt_path = self.config.prompts_dir / "evaluator_benchmark_system.txt"
+
+        try:
+            content = call_claude_cli(
+                user_content=user_content,
+                system_prompt_file=str(system_prompt_path),
+                model=self.config.model,
+                config=self.config,
+            )
+        except Exception as e:
+            print(f"    Benchmark evaluation failed: {e}")
+            return self._default_result(rollout, f"CLI error: {e}")
+
+        return self._parse_evaluation(rollout, content)
+
+    def _parse_evaluation(
+        self, rollout: ActorResult, content: str
+    ) -> EvaluationResult:
+        """Parse CLI output into an EvaluationResult."""
+        content = content.strip()
         # Strip markdown fences if present
         if content.startswith("```"):
             lines = content.split("\n")
-            # Remove first and last fence lines
             if lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].strip() == "```":
@@ -163,21 +187,11 @@ class EvaluatorManager:
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
-            return EvaluationResult(
-                task_id=rollout.task_id,
-                question=rollout.question,
-                level=rollout.level,
-                scores=DEFAULT_SCORES.copy(),
-                overall_score=1,
-                feedback=f"Failed to parse evaluation JSON: {content[:200]}",
-                improvement_areas=[],
-                final_answer=rollout.final_answer,
-                ground_truth=rollout.ground_truth,
-                is_correct=rollout.is_correct,
+            return self._default_result(
+                rollout, f"Failed to parse JSON: {content[:200]}"
             )
 
         scores = data.get("scores", DEFAULT_SCORES)
-        # Ensure all expected keys exist
         for key in DEFAULT_SCORES:
             if key not in scores:
                 scores[key] = 1
@@ -194,3 +208,72 @@ class EvaluatorManager:
             ground_truth=rollout.ground_truth,
             is_correct=rollout.is_correct,
         )
+
+    def _default_result(
+        self, rollout: ActorResult, feedback: str
+    ) -> EvaluationResult:
+        return EvaluationResult(
+            task_id=rollout.task_id,
+            question=rollout.question,
+            level=rollout.level,
+            scores=DEFAULT_SCORES.copy(),
+            overall_score=1,
+            feedback=feedback,
+            improvement_areas=[],
+            final_answer=rollout.final_answer,
+            ground_truth=rollout.ground_truth,
+            is_correct=rollout.is_correct,
+        )
+
+
+def call_claude_cli(
+    user_content: str,
+    system_prompt_file: str,
+    model: str,
+    config: "Config",
+) -> str:
+    """Call Claude Code CLI with prompt piped via stdin. Returns the result text."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write prompt to file
+        prompt_file = Path(tmpdir) / "prompt.txt"
+        prompt_file.write_text(user_content)
+
+        # Write a shell script to avoid escaping issues
+        script_file = Path(tmpdir) / "run.sh"
+        script_file.write_text(
+            '#!/bin/bash\n'
+            f'claude -p "$(cat {prompt_file})" '
+            f'--model {model} '
+            f'--max-turns 1 '
+            f'--output-format json '
+            f'--append-system-prompt-file {system_prompt_file} '
+            f'--dangerously-skip-permissions\n'
+        )
+        script_file.chmod(0o755)
+
+        env = dict(os.environ)
+        if config.api_key:
+            env["ANTHROPIC_API_KEY"] = config.api_key
+        if config.oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = config.oauth_token
+
+        result = subprocess.run(
+            ["bash", str(script_file)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI failed (exit {result.returncode}): "
+            f"{result.stderr[:500]}"
+        )
+
+    # Parse JSON output to get the result text
+    try:
+        output = json.loads(result.stdout)
+        return output.get("result", result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout

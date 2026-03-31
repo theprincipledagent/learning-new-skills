@@ -1,4 +1,15 @@
-"""Skill management: load, save, strip, trust-region."""
+"""Skill management: load, save, strip, trust-region.
+
+Skills live in folders: skills/<skill-name>/SKILL.md
+Each SKILL.md has YAML frontmatter + markdown body:
+
+---
+name: skill-name
+description: When to use this skill
+---
+
+Markdown instructions the agent follows.
+"""
 
 import re
 from dataclasses import dataclass, field
@@ -10,43 +21,48 @@ import yaml
 
 @dataclass
 class Skill:
-    filename: str
     name: str
     description: str
-    instructions: list[str]
+    body: str
     evolution_notes: list[str] = field(default_factory=list)
 
-    def to_yaml_with_notes(self) -> str:
-        """Full YAML with evolution comments for the evolver."""
+    def to_file_content(self) -> str:
+        """Full SKILL.md content with evolution notes as HTML comments."""
         lines = [
+            "---",
             f"name: {self.name}",
             f"description: {self.description}",
-            "instructions:",
+            "---",
+            "",
+            self.body,
         ]
-        # Ensure all instructions are strings
-        str_instructions = [str(i) if not isinstance(i, str) else i for i in self.instructions]
-        for instruction in str_instructions:
-            lines.append(f"  - {_yaml_quote(instruction)}")
-        # Append evolution notes as trailing comments
-        for en in self.evolution_notes:
-            lines.append(f"  # {en}")
-        return "\n".join(lines) + "\n"
+        if self.evolution_notes:
+            lines.append("")
+            for en in self.evolution_notes:
+                lines.append(f"<!-- {en} -->")
+        content = "\n".join(lines)
+        if not content.endswith("\n"):
+            content += "\n"
+        return content
 
-    def to_yaml_stripped(self) -> str:
-        """Clean YAML without evolution comments for the actor."""
-        data = {
-            "name": self.name,
-            "description": self.description,
-            "instructions": self.instructions,
-        }
-        return yaml.dump(data, default_flow_style=False, sort_keys=False)
+    def to_stripped_content(self) -> str:
+        """Content without evolution notes (for trust region comparison)."""
+        lines = [
+            "---",
+            f"name: {self.name}",
+            f"description: {self.description}",
+            "---",
+            "",
+            self.body,
+        ]
+        content = "\n".join(lines)
+        if not content.endswith("\n"):
+            content += "\n"
+        return content
 
     def to_system_prompt_block(self) -> str:
-        """Formatted text block for inclusion in system prompt."""
-        lines = [f"### {self.name}", f"{self.description}", ""]
-        for i, instruction in enumerate(self.instructions, 1):
-            lines.append(f"{i}. {instruction}")
-        return "\n".join(lines)
+        """Formatted text block for inclusion in actor system prompt."""
+        return f"### {self.name}\n{self.description}\n\n{self.body}"
 
 
 class SkillManager:
@@ -55,61 +71,67 @@ class SkillManager:
         self.skills: dict[str, Skill] = {}
 
     def load_all(self) -> None:
-        """Load all skill YAML files from the skills directory."""
+        """Load all skills from skills/<name>/SKILL.md."""
         self.skills.clear()
         if not self.skills_dir.exists():
             self.skills_dir.mkdir(parents=True, exist_ok=True)
             return
 
-        for path in sorted(self.skills_dir.glob("*.yaml")):
-            skill = self._load_skill(path)
+        for skill_md in sorted(self.skills_dir.glob("*/SKILL.md")):
+            skill = self._load_skill(skill_md)
             if skill:
-                self.skills[skill.filename] = skill
+                self.skills[skill.name] = skill
 
     def save_all(self) -> None:
-        """Save all skills to the skills directory."""
+        """Save all skills to skills/<name>/SKILL.md."""
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         for skill in self.skills.values():
-            path = self.skills_dir / skill.filename
-            path.write_text(skill.to_yaml_with_notes())
+            skill_dir = self.skills_dir / skill.name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(skill.to_file_content())
 
     def _load_skill(self, path: Path) -> Skill | None:
-        """Load a single skill from a YAML file, preserving evolution comments."""
+        """Load a skill from a SKILL.md file."""
         content = path.read_text()
 
-        # Extract evolution comments
-        evolution_notes = re.findall(
-            r"#\s*(\[EVOLUTION[^\]]*\][^\n]*)", content
-        )
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", content, re.DOTALL)
+        if not match:
+            return None
 
-        # Parse YAML (comments are stripped by parser)
         try:
-            data = yaml.safe_load(content)
+            frontmatter = yaml.safe_load(match.group(1))
         except yaml.YAMLError:
             return None
 
-        if not isinstance(data, dict):
+        if not isinstance(frontmatter, dict):
             return None
 
-        raw_instructions = data.get("instructions", [])
-        instructions = [str(i) if not isinstance(i, str) else i for i in raw_instructions]
+        body = match.group(2).strip()
+
+        # Extract evolution notes from HTML comments
+        evolution_notes = re.findall(r"<!--\s*(.*?)\s*-->", content)
+
+        # Remove evolution note comments from body
+        clean_body = re.sub(r"\n*<!--\s*.*?\s*-->\n*", "", body).strip()
+
+        # Skill name comes from folder name or frontmatter
+        folder_name = path.parent.name
+        name = frontmatter.get("name", folder_name)
 
         return Skill(
-            filename=path.name,
-            name=data.get("name", path.stem),
-            description=data.get("description", ""),
-            instructions=instructions,
+            name=name,
+            description=frontmatter.get("description", ""),
+            body=clean_body,
             evolution_notes=evolution_notes,
         )
 
     def build_system_prompt(self, template_path: Path) -> str:
-        """Render the actor system prompt template with stripped skills."""
+        """Render the actor system prompt template with skills."""
         template = template_path.read_text()
         skills_block = self._build_skills_block()
         return template.replace("{skills_block}", skills_block)
 
     def _build_skills_block(self) -> str:
-        """Build the skills block for the system prompt."""
         if not self.skills:
             return "(No skills learned yet. This is the first epoch.)"
 
@@ -119,10 +141,10 @@ class SkillManager:
         return "\n\n".join(blocks)
 
     def get_skills_with_notes(self) -> dict[str, str]:
-        """Get all skills as YAML with evolution notes (for evolver)."""
+        """Get all skills with evolution notes (for evolver)."""
         return {
-            filename: skill.to_yaml_with_notes()
-            for filename, skill in self.skills.items()
+            name: skill.to_file_content()
+            for name, skill in self.skills.items()
         }
 
 
@@ -133,48 +155,35 @@ def apply_trust_region(
 ) -> tuple[dict[str, Skill], list[str]]:
     """Apply trust region constraint to skill evolution.
 
-    Compares stripped YAML only (evolution notes don't count).
-    New skills are always accepted. Deletions are rejected.
-
-    Returns (accepted_skills, rejection_messages).
+    Compares stripped content (without evolution notes).
+    New skills always accepted. Deletions rejected.
     """
     accepted: dict[str, Skill] = {}
     rejections: list[str] = []
 
-    # Check for deletions (always rejected)
-    for filename in current_skills:
-        if filename not in new_skills:
+    for name in current_skills:
+        if name not in new_skills:
             rejections.append(
-                f"Rejected deletion of {filename}: skill removal not allowed"
+                f"Rejected deletion of {name}: skill removal not allowed"
             )
-            accepted[filename] = current_skills[filename]
+            accepted[name] = current_skills[name]
 
-    for filename, new_skill in new_skills.items():
-        if filename not in current_skills:
-            # New skill: always accept
-            accepted[filename] = new_skill
+    for name, new_skill in new_skills.items():
+        if name not in current_skills:
+            accepted[name] = new_skill
             continue
 
-        # Existing skill: check change ratio
-        old_yaml = current_skills[filename].to_yaml_stripped()
-        new_yaml = new_skill.to_yaml_stripped()
-
-        ratio = 1.0 - SequenceMatcher(None, old_yaml, new_yaml).ratio()
+        old_content = current_skills[name].to_stripped_content()
+        new_content = new_skill.to_stripped_content()
+        ratio = 1.0 - SequenceMatcher(None, old_content, new_content).ratio()
 
         if ratio < threshold:
-            accepted[filename] = new_skill
+            accepted[name] = new_skill
         else:
             rejections.append(
-                f"Rejected change to {filename}: "
+                f"Rejected change to {name}: "
                 f"change ratio {ratio:.2f} exceeds threshold {threshold:.2f}"
             )
-            accepted[filename] = current_skills[filename]
+            accepted[name] = current_skills[name]
 
     return accepted, rejections
-
-
-def _yaml_quote(s: str) -> str:
-    """Quote a YAML string if it contains special characters."""
-    if any(c in s for c in ":#{}[]|>&*!%@`"):
-        return f'"{s}"'
-    return s

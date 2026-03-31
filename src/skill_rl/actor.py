@@ -3,6 +3,7 @@
 import json
 import re
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,7 +122,7 @@ class ActorManager:
             f'--model {self.config.model} '
             f'--verbose '
             f'--output-format stream-json '
-            f'--append-system-prompt-file /work/system_prompt.txt '
+            f'--append-system-prompt-file /etc/claude/system_prompt.txt '
             f'--allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch" '
             f'--max-turns {self.config.max_actor_turns} '
             f'--dangerously-skip-permissions\n'
@@ -133,7 +134,7 @@ class ActorManager:
         volumes = {
             str(work_dir.resolve()): {"bind": "/work", "mode": "rw"},
             str(system_prompt_path.resolve()): {
-                "bind": "/work/system_prompt.txt",
+                "bind": "/etc/claude/system_prompt.txt",
                 "mode": "ro",
             },
         }
@@ -150,6 +151,12 @@ class ActorManager:
         # Claude Code may write to stdout or stderr; combine for parsing
         combined_output = stdout + "\n" + stderr
         transcript_raw = combined_output
+
+        # Check for billing/auth errors in stream-json before parsing
+        error = self._check_for_error(combined_output)
+        if error:
+            raise RuntimeError(f"Claude Code error: {error}")
+
         transcript_formatted = self._format_transcript(combined_output)
         final_answer = self._extract_answer(combined_output)
         is_correct = check_answer(final_answer, question.final_answer)
@@ -180,6 +187,27 @@ class ActorManager:
             ground_truth=question.final_answer,
             is_correct=is_correct,
         )
+
+    def _check_for_error(self, raw_output: str) -> str | None:
+        """Check stream-json output for fatal errors (billing, auth, etc.)."""
+        for line in raw_output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                error = event.get("error")
+                if error and event.get("type") in ("assistant", "result"):
+                    # Extract human-readable message
+                    content = event.get("message", {}).get("content", [])
+                    if isinstance(content, list) and content:
+                        msg = content[0].get("text", error)
+                    else:
+                        msg = event.get("result", error)
+                    return f"{msg} ({error})"
+            except json.JSONDecodeError:
+                continue
+        return None
 
     def _format_transcript(self, raw_output: str) -> str:
         """Parse stream-json NDJSON output into a formatted transcript."""
