@@ -1,4 +1,4 @@
-# Skill RL
+# Learning New Skills
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 A RL/APO system that automatically evolves [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill files by iteratively solving, evaluating, and learning from in-use rollouts.
