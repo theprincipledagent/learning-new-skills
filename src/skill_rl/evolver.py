@@ -1,5 +1,6 @@
 """Evolver orchestration: rewrites skills based on worst evaluations."""
 
+import difflib
 import json
 import math
 import re
@@ -94,7 +95,8 @@ class EvolverManager:
         except Exception as e:
             print(f"  WARNING: Evolution failed - {e}")
             self._save_evolution_record(
-                epoch_dir, epoch, worst_evals, {}, [], str(e)
+                epoch_dir, epoch, worst_evals,
+                skill_mgr.skills, skill_mgr.skills, [], str(e)
             )
             return
 
@@ -116,7 +118,8 @@ class EvolverManager:
         except json.JSONDecodeError:
             print(f"  WARNING: Failed to parse evolution JSON: {content[:500]}")
             self._save_evolution_record(
-                epoch_dir, epoch, worst_evals, {}, [],
+                epoch_dir, epoch, worst_evals,
+                skill_mgr.skills, skill_mgr.skills, [],
                 f"JSON parse error: {content[:200]}"
             )
             return
@@ -138,7 +141,8 @@ class EvolverManager:
         if not new_skills:
             print("  WARNING: Evolution produced no valid skills")
             self._save_evolution_record(
-                epoch_dir, epoch, worst_evals, {}, [],
+                epoch_dir, epoch, worst_evals,
+                skill_mgr.skills, skill_mgr.skills, [],
                 data.get("reasoning", "No skills produced")
             )
             return
@@ -153,6 +157,9 @@ class EvolverManager:
             for msg in rejections:
                 print(f"    {msg}")
 
+        # Capture old skills before overwrite (for diff in evolution record)
+        old_skills = dict(skill_mgr.skills)
+
         # Update skill manager
         skill_mgr.skills = accepted
         skill_mgr.save_all()
@@ -163,7 +170,7 @@ class EvolverManager:
         print(f"  Reasoning: {reasoning[:200]}")
 
         self._save_evolution_record(
-            epoch_dir, epoch, worst_evals, accepted, rejections, reasoning
+            epoch_dir, epoch, worst_evals, old_skills, accepted, rejections, reasoning
         )
 
     def _parse_skill_file(self, skill_name: str, file_content: str | dict) -> Skill | None:
@@ -216,17 +223,53 @@ class EvolverManager:
         epoch_dir: Path,
         epoch: int,
         worst_evals: list[EvaluationResult],
+        old_skills: dict[str, Skill],
         accepted: dict[str, Skill],
         rejections: list[str],
         reasoning: str,
     ) -> None:
-        """Save evolution metadata."""
+        """Save evolution metadata with per-skill diffs."""
+        # Compute per-skill changes
+        skill_changes = {}
+        all_names = sorted(set(old_skills.keys()) | set(accepted.keys()))
+        for name in all_names:
+            before = old_skills.get(name)
+            after = accepted.get(name)
+            before_content = before.to_file_content() if before else ""
+            after_content = after.to_file_content() if after else ""
+
+            if before is None:
+                change_type = "added"
+            elif after is None:
+                change_type = "removed"
+            elif before_content == after_content:
+                change_type = "unchanged"
+            else:
+                change_type = "modified"
+
+            diff_text = ""
+            if change_type in ("modified", "added", "removed"):
+                diff_text = "\n".join(difflib.unified_diff(
+                    before_content.splitlines(),
+                    after_content.splitlines(),
+                    fromfile=f"before/{name}/SKILL.md",
+                    tofile=f"after/{name}/SKILL.md",
+                    lineterm="",
+                ))
+
+            skill_changes[name] = {
+                "change_type": change_type,
+                "diff": diff_text,
+            }
+
         record = {
             "epoch": epoch,
             "n_worst_evaluated": len(worst_evals),
             "worst_scores": [e.overall_score for e in worst_evals],
+            "n_skills_before": len(old_skills),
             "n_skills_after": len(accepted),
             "skill_filenames": list(accepted.keys()),
+            "skill_changes": skill_changes,
             "rejections": rejections,
             "reasoning": reasoning,
         }

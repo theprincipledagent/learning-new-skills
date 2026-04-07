@@ -1,6 +1,8 @@
 """Main entry point for skill_rl."""
 
 import argparse
+import difflib
+import json
 import sys
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from .evaluator import EvaluatorManager
 from .evolver import EvolverManager
 from .gaia import GaiaDataset
 from .metrics import MetricsTracker
-from .skills import SkillManager
+from .skills import Skill, SkillManager
 
 
 def parse_args() -> Config:
@@ -36,6 +38,8 @@ def parse_args() -> Config:
     parser.add_argument("--max-parallel-actors", type=int, default=5)
     parser.add_argument("--trust-region-threshold", type=float, default=0.3)
     parser.add_argument("--bottom-percentile", type=float, default=0.2)
+    parser.add_argument("--rollback-threshold", type=float, default=0.05,
+                        help="Roll back skills if accuracy drops by this amount (default: 0.05)")
     parser.add_argument("--actor-timeout", type=int, default=600,
                         help="Actor timeout in seconds")
 
@@ -70,6 +74,7 @@ def parse_args() -> Config:
         max_parallel_actors=args.max_parallel_actors,
         trust_region_threshold=args.trust_region_threshold,
         bottom_percentile=args.bottom_percentile,
+        rollback_threshold=args.rollback_threshold,
         actor_timeout_seconds=args.actor_timeout,
         data_dir=args.data_dir,
         skills_dir=args.skills_dir,
@@ -118,6 +123,10 @@ def main():
     skill_mgr.load_all()
     print(f"  Loaded {len(skill_mgr.skills)} existing skills")
 
+    # Rollback state: tracks the last "good" checkpoint
+    best_accuracy: float | None = None
+    best_skills: dict[str, Skill] | None = None
+
     # Main training loop
     for epoch in range(config.start_epoch, config.num_epochs):
         print(f"\n{'#' * 60}")
@@ -146,12 +155,43 @@ def main():
         )
         print(f"  Evaluation complete: avg score {avg_score:.1f}/10")
 
-        # 4. Evolver phase
-        print(f"\n--- Evolver Phase ---")
-        evolver_mgr.evolve_skills(evaluations, skill_mgr, epoch)
-        evolution_summary = (
-            f"{len(skill_mgr.skills)} skills after evolution"
+        # Compute current accuracy for rollback check
+        current_accuracy = n_correct / len(rollouts) if rollouts else 0.0
+
+        # 4. Evolver phase (or rollback)
+        degraded = (
+            best_accuracy is not None
+            and current_accuracy < best_accuracy - config.rollback_threshold
         )
+
+        if degraded:
+            print(f"\n--- Rollback ---")
+            print(f"  Accuracy dropped {best_accuracy:.1%} -> {current_accuracy:.1%} "
+                  f"(threshold: {config.rollback_threshold:.1%})")
+            print(f"  Rolling back to previous skills")
+
+            old_skills = dict(skill_mgr.skills)
+            skill_mgr.skills = {name: skill for name, skill in best_skills.items()}
+            skill_mgr.save_all()
+
+            _save_rollback_record(
+                config.epoch_dir(epoch), epoch, best_accuracy,
+                current_accuracy, old_skills, skill_mgr.skills,
+            )
+
+            evolution_summary = (
+                f"ROLLBACK: {len(skill_mgr.skills)} skills "
+                f"(accuracy {best_accuracy:.1%} -> {current_accuracy:.1%})"
+            )
+        else:
+            print(f"\n--- Evolver Phase ---")
+            best_skills = {name: skill for name, skill in skill_mgr.skills.items()}
+            best_accuracy = current_accuracy
+
+            evolver_mgr.evolve_skills(evaluations, skill_mgr, epoch)
+            evolution_summary = (
+                f"{len(skill_mgr.skills)} skills after evolution"
+            )
 
         # 5. Compute and save metrics
         metrics = metrics_tracker.compute_epoch_metrics(
@@ -164,6 +204,65 @@ def main():
         metrics_tracker.print_summary(metrics)
 
     print("\nTraining complete!")
+
+
+def _save_rollback_record(
+    epoch_dir: Path,
+    epoch: int,
+    prev_accuracy: float,
+    current_accuracy: float,
+    old_skills: dict[str, Skill],
+    restored_skills: dict[str, Skill],
+) -> None:
+    """Save an evolution.json record for a rollback event."""
+    skill_changes = {}
+    all_names = sorted(set(old_skills.keys()) | set(restored_skills.keys()))
+    for name in all_names:
+        before = old_skills.get(name)
+        after = restored_skills.get(name)
+        before_content = before.to_file_content() if before else ""
+        after_content = after.to_file_content() if after else ""
+
+        if before is None:
+            change_type = "added"
+        elif after is None:
+            change_type = "removed"
+        elif before_content == after_content:
+            change_type = "unchanged"
+        else:
+            change_type = "modified"
+
+        diff_text = ""
+        if change_type in ("modified", "added", "removed"):
+            diff_text = "\n".join(difflib.unified_diff(
+                before_content.splitlines(),
+                after_content.splitlines(),
+                fromfile=f"before/{name}/SKILL.md",
+                tofile=f"after/{name}/SKILL.md",
+                lineterm="",
+            ))
+
+        skill_changes[name] = {
+            "change_type": change_type,
+            "diff": diff_text,
+        }
+
+    record = {
+        "epoch": epoch,
+        "action": "rollback",
+        "prev_accuracy": prev_accuracy,
+        "current_accuracy": current_accuracy,
+        "n_skills_before": len(old_skills),
+        "n_skills_after": len(restored_skills),
+        "skill_filenames": list(restored_skills.keys()),
+        "skill_changes": skill_changes,
+        "rejections": [],
+        "reasoning": (
+            f"Accuracy dropped from {prev_accuracy:.1%} to {current_accuracy:.1%}. "
+            f"Rolled back skills to previous checkpoint."
+        ),
+    }
+    (epoch_dir / "evolution.json").write_text(json.dumps(record, indent=2))
 
 
 if __name__ == "__main__":

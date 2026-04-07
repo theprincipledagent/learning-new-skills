@@ -27,6 +27,7 @@ class Config:
     max_parallel_actors: int = 5
     trust_region_threshold: float = 0.3
     bottom_percentile: float = 0.2
+    rollback_threshold: float = 0.05
     actor_timeout_seconds: int = 600
 
     # Paths
