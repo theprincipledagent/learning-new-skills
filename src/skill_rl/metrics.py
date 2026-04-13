@@ -19,6 +19,9 @@ class EpochMetrics:
     avg_overall_score: float
     n_skills: int
     evolution_summary: str
+    test_n_questions: int = 0
+    test_n_correct: int = 0
+    test_accuracy: float = 0.0
 
 
 class MetricsTracker:
@@ -32,6 +35,7 @@ class MetricsTracker:
         evaluations: list[EvaluationResult],
         n_skills: int,
         evolution_summary: str,
+        test_results: list | None = None,
     ) -> EpochMetrics:
         """Compute metrics for a single epoch."""
         n_questions = len(evaluations)
@@ -63,6 +67,11 @@ class MetricsTracker:
             else 0.0
         )
 
+        # Test set metrics
+        test_n = len(test_results) if test_results else 0
+        test_correct = sum(1 for r in test_results if r.is_correct) if test_results else 0
+        test_acc = test_correct / test_n if test_n > 0 else 0.0
+
         metrics = EpochMetrics(
             epoch=epoch,
             n_questions=n_questions,
@@ -73,6 +82,9 @@ class MetricsTracker:
             avg_overall_score=avg_overall,
             n_skills=n_skills,
             evolution_summary=evolution_summary,
+            test_n_questions=test_n,
+            test_n_correct=test_correct,
+            test_accuracy=test_acc,
         )
 
         self.history.append(metrics)
@@ -96,6 +108,9 @@ class MetricsTracker:
             "avg_overall_score": metrics.avg_overall_score,
             "n_skills": metrics.n_skills,
             "evolution_summary": metrics.evolution_summary,
+            "test_n_questions": metrics.test_n_questions,
+            "test_n_correct": metrics.test_n_correct,
+            "test_accuracy": metrics.test_accuracy,
         }
         (epoch_dir / "metrics.json").write_text(json.dumps(epoch_data, indent=2))
 
@@ -105,6 +120,7 @@ class MetricsTracker:
             history_data.append({
                 "epoch": m.epoch,
                 "accuracy": m.accuracy,
+                "test_accuracy": m.test_accuracy,
                 "avg_overall_score": m.avg_overall_score,
                 "n_skills": m.n_skills,
             })
@@ -117,10 +133,16 @@ class MetricsTracker:
         print(f"\n{'=' * 60}")
         print(f"EPOCH {metrics.epoch} SUMMARY")
         print(f"{'=' * 60}")
-        print(f"Questions: {metrics.n_questions}")
-        print(f"Correct:   {metrics.n_correct}/{metrics.n_questions} "
+        print(f"Training set pass@1:")
+        print(f"  Questions: {metrics.n_questions}")
+        print(f"  Correct:   {metrics.n_correct}/{metrics.n_questions} "
               f"({metrics.accuracy:.1%})")
-        print(f"Skills:    {metrics.n_skills}")
+        if metrics.test_n_questions > 0:
+            print(f"\nTest set pass@1 (heldout):")
+            print(f"  Questions: {metrics.test_n_questions}")
+            print(f"  Correct:   {metrics.test_n_correct}/{metrics.test_n_questions} "
+                  f"({metrics.test_accuracy:.1%})")
+        print(f"\nSkills:    {metrics.n_skills}")
         print()
 
         # Accuracy by level
@@ -141,9 +163,10 @@ class MetricsTracker:
         # History
         if len(self.history) > 1:
             print("\nProgress across epochs:")
-            print(f"  {'Epoch':>5s}  {'Accuracy':>8s}  {'Eval Score':>10s}  {'Skills':>6s}")
+            print(f"  {'Epoch':>5s}  {'Train':>8s}  {'Test':>8s}  {'Eval Score':>10s}  {'Skills':>6s}")
             for m in self.history:
-                print(f"  {m.epoch:5d}  {m.accuracy:8.1%}  "
+                test_str = f"{m.test_accuracy:8.1%}" if m.test_n_questions > 0 else "     N/A"
+                print(f"  {m.epoch:5d}  {m.accuracy:8.1%}  {test_str}  "
                       f"{m.avg_overall_score:10.1f}  {m.n_skills:6d}")
 
         print(f"\nEvolution: {metrics.evolution_summary}")

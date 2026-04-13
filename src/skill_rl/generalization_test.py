@@ -2,11 +2,10 @@
 
 Samples 50 questions from the GAIA validation split that were NOT used during
 skill-rl training (which uses seed=42 to sample 100 questions).  Runs the
-exact same actor pipeline (Docker + Claude Code CLI + skills) and reports
-accuracy.
+exact same actor pipeline (Docker + smolagents + skills) and reports accuracy.
 
 Usage:
-    python -m skill_rl.generalization_test --api-key <KEY> [OPTIONS]
+    python -m skill_rl.generalization_test [OPTIONS]
 """
 
 import argparse
@@ -27,22 +26,18 @@ def parse_args() -> tuple[Config, int, int, Path, int, int]:
         description="Generalization test: evaluate evolved skills on unseen GAIA questions"
     )
 
-    # Auth
-    parser.add_argument("--api-key", type=str, default="",
-                        help="Anthropic API key")
-    parser.add_argument("--oauth-token", type=str, default="",
-                        help="Claude Code OAuth token")
-
-    # Model
-    parser.add_argument("--model", type=str, default="haiku",
-                        help="Actor model (default: haiku)")
+    # LLM
+    parser.add_argument("--api-base", type=str, default=None,
+                        help="LiteLLM API base URL (default: None, uses provider default)")
+    parser.add_argument("--model-id", type=str, default="gemini/gemini-2.5-flash-lite",
+                        help="LiteLLM model ID (default: gemini/gemini-2.5-flash-lite)")
 
     # Test params
     parser.add_argument("--num-questions", type=int, default=50,
                         help="Number of held-out questions to test (default: 50)")
     parser.add_argument("--max-actor-turns", type=int, default=25)
     parser.add_argument("--max-parallel-actors", type=int, default=5)
-    parser.add_argument("--actor-timeout", type=int, default=600,
+    parser.add_argument("--actor-timeout", type=int, default=1800,
                         help="Actor timeout in seconds")
     parser.add_argument("--test-seed", type=int, default=123,
                         help="RNG seed for sampling held-out questions (default: 123)")
@@ -63,15 +58,12 @@ def parse_args() -> tuple[Config, int, int, Path, int, int]:
     # Docker
     parser.add_argument("--actor-image", type=str,
                         default="skill-rl-actor:latest")
-    parser.add_argument("--llm-image", type=str,
-                        default="skill-rl-llm:latest")
 
     args = parser.parse_args()
 
     config = Config(
-        api_key=args.api_key,
-        oauth_token=args.oauth_token,
-        model=args.model,
+        api_base=args.api_base,
+        model_id=args.model_id,
         num_epochs=1,
         questions_per_epoch=args.num_questions,
         max_actor_turns=args.max_actor_turns,
@@ -81,7 +73,6 @@ def parse_args() -> tuple[Config, int, int, Path, int, int]:
         skills_dir=args.skills_dir,
         prompts_dir=args.prompts_dir,
         actor_image=args.actor_image,
-        llm_image=args.llm_image,
     )
 
     return (
@@ -210,9 +201,7 @@ def main():
     print("Building Docker images...")
     docker_mgr.ensure_images(
         actor_image=config.actor_image,
-        llm_image=config.llm_image,
         actor_dir="docker/actor",
-        llm_dir="docker/llm",
     )
 
     # Load GAIA dataset
@@ -268,7 +257,7 @@ def main():
             "test_seed": test_seed,
             "training_seed": training_seed,
             "training_questions_per_epoch": training_n,
-            "model": config.model,
+            "model_id": config.model_id,
             "max_actor_turns": config.max_actor_turns,
             "n_skills": len(skill_mgr.skills),
             "skill_names": list(skill_mgr.skills.keys()),

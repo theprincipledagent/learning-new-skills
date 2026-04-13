@@ -12,24 +12,21 @@ from .docker_utils import DockerManager
 from .evaluator import EvaluatorManager
 from .evolver import EvolverManager
 from .gaia import GaiaDataset
+from .generalization_test import get_held_out_questions
 from .metrics import MetricsTracker
 from .skills import Skill, SkillManager
 
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
-        description="Skill RL: evolve Claude Code skills via GAIA benchmark"
+        description="Skill RL: evolve agent skills via GAIA benchmark"
     )
 
-    # Auth
-    parser.add_argument("--api-key", type=str, default="",
-                        help="Anthropic API key")
-    parser.add_argument("--oauth-token", type=str, default="",
-                        help="Claude Code OAuth token")
-
-    # Model
-    parser.add_argument("--model", type=str, default="haiku",
-                        help="Actor model (default: haiku)")
+    # LLM
+    parser.add_argument("--api-base", type=str, default=None,
+                        help="LiteLLM API base URL (default: None, uses provider default)")
+    parser.add_argument("--model-id", type=str, default="gemini/gemini-2.5-flash-lite",
+                        help="LiteLLM model ID (default: gemini/gemini-2.5-flash-lite)")
 
     # Training
     parser.add_argument("--num-epochs", type=int, default=10)
@@ -40,7 +37,7 @@ def parse_args() -> Config:
     parser.add_argument("--bottom-percentile", type=float, default=0.2)
     parser.add_argument("--rollback-threshold", type=float, default=0.05,
                         help="Roll back skills if accuracy drops by this amount (default: 0.05)")
-    parser.add_argument("--actor-timeout", type=int, default=600,
+    parser.add_argument("--actor-timeout", type=int, default=1800,
                         help="Actor timeout in seconds")
 
     # Paths
@@ -51,12 +48,16 @@ def parse_args() -> Config:
     # Docker
     parser.add_argument("--actor-image", type=str,
                         default="skill-rl-actor:latest")
-    parser.add_argument("--llm-image", type=str,
-                        default="skill-rl-llm:latest")
 
     # Evaluation mode
     parser.add_argument("--use-benchmark-score", action="store_true",
                         help="Use ground truth to diagnose failures instead of blind evaluation")
+
+    # Test set
+    parser.add_argument("--test-questions", type=int, default=50,
+                        help="Number of heldout test questions for pass@1 reporting (default: 50)")
+    parser.add_argument("--test-seed", type=int, default=123,
+                        help="RNG seed for sampling heldout test questions (default: 123)")
 
     # Resume
     parser.add_argument("--start-epoch", type=int, default=0,
@@ -65,9 +66,8 @@ def parse_args() -> Config:
     args = parser.parse_args()
 
     return Config(
-        api_key=args.api_key,
-        oauth_token=args.oauth_token,
-        model=args.model,
+        api_base=args.api_base,
+        model_id=args.model_id,
         num_epochs=args.num_epochs,
         questions_per_epoch=args.questions_per_epoch,
         max_actor_turns=args.max_actor_turns,
@@ -80,8 +80,9 @@ def parse_args() -> Config:
         skills_dir=args.skills_dir,
         prompts_dir=args.prompts_dir,
         actor_image=args.actor_image,
-        llm_image=args.llm_image,
         use_benchmark_score=args.use_benchmark_score,
+        test_questions=args.test_questions,
+        test_seed=args.test_seed,
         start_epoch=args.start_epoch,
     )
 
@@ -104,13 +105,11 @@ def main():
     evaluator_mgr = EvaluatorManager(config)
     evolver_mgr = EvolverManager(config)
 
-    # Build Docker images (only actor image needed)
+    # Build Docker images
     print("Building Docker images...")
     docker_mgr.ensure_images(
         actor_image=config.actor_image,
-        llm_image=config.llm_image,
         actor_dir="docker/actor",
-        llm_dir="docker/llm",
     )
 
     # Load GAIA dataset
@@ -122,6 +121,16 @@ def main():
     # Load existing skills
     skill_mgr.load_all()
     print(f"  Loaded {len(skill_mgr.skills)} existing skills")
+
+    # Sample heldout test set (fixed across all epochs)
+    test_questions = get_held_out_questions(
+        gaia,
+        training_n=config.questions_per_epoch,
+        training_seed=42,
+        test_n=config.test_questions,
+        test_seed=config.test_seed,
+    )
+    print(f"  Sampled {len(test_questions)} heldout test questions")
 
     # Rollback state: tracks the last "good" checkpoint
     best_accuracy: float | None = None
@@ -158,7 +167,16 @@ def main():
         # Compute current accuracy for rollback check
         current_accuracy = n_correct / len(rollouts) if rollouts else 0.0
 
-        # 4. Evolver phase (or rollback)
+        # 4. Test set actor phase (heldout pass@1, before evolution)
+        print(f"\n--- Test Set Phase ---")
+        test_rollouts = actor_mgr.run_epoch(
+            test_questions, gaia, skill_mgr, epoch,
+            rollouts_subdir="test_rollouts",
+        )
+        test_correct = sum(1 for r in test_rollouts if r.is_correct)
+        print(f"  Test phase complete: {test_correct}/{len(test_rollouts)} correct")
+
+        # 5. Evolver phase (or rollback)
         degraded = (
             best_accuracy is not None
             and current_accuracy < best_accuracy - config.rollback_threshold
@@ -193,12 +211,13 @@ def main():
                 f"{len(skill_mgr.skills)} skills after evolution"
             )
 
-        # 5. Compute and save metrics
+        # 6. Compute and save metrics
         metrics = metrics_tracker.compute_epoch_metrics(
             epoch=epoch,
             evaluations=evaluations,
             n_skills=len(skill_mgr.skills),
             evolution_summary=evolution_summary,
+            test_results=test_rollouts,
         )
         metrics_tracker.save_metrics(epoch, metrics)
         metrics_tracker.print_summary(metrics)

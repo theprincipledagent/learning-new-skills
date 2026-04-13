@@ -12,6 +12,7 @@ The agent solves research questions from the GAIA benchmark using tools (web sea
 4. **Do not remove skills**: You may modify existing skills or add new ones, but never delete a skill entirely.
 5. **Add evolution notes**: Every change MUST include an HTML comment `<!-- [EVOLUTION cycle N] explanation -->` noting what changed and why.
 6. **Learn from patterns**: Look for recurring failure modes across evaluations, not just one-off issues.
+7. **Do not use examples**: Do not include examples in the skill files. The directions should be clear enough that the agent can understand without examples. We do not want to anchor the agent to specific examples, but rather to the underlying principles.
 
 ## Skill File Format
 

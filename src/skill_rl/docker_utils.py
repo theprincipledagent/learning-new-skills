@@ -28,23 +28,22 @@ class DockerManager:
                     print(f"    {chunk['stream'].strip()}")
             raise
 
-    def ensure_images(self, actor_image: str, llm_image: str,
-                      actor_dir: str, llm_dir: str) -> None:
-        """Build actor and llm images if not present."""
-        for tag, build_dir in [(actor_image, actor_dir), (llm_image, llm_dir)]:
-            try:
-                self.client.images.get(tag)
-                print(f"Image {tag} already exists")
-            except ImageNotFound:
-                self.build_image(build_dir, tag)
+    def ensure_images(self, actor_image: str, actor_dir: str) -> None:
+        """Build actor image if not present."""
+        try:
+            self.client.images.get(actor_image)
+            print(f"Image {actor_image} already exists")
+        except ImageNotFound:
+            self.build_image(actor_dir, actor_image)
 
     def run_container(
         self,
         image: str,
-        command: str | list[str],
+        command: str | list[str] | None = None,
         env: dict[str, str] | None = None,
         volumes: dict[str, dict] | None = None,
         timeout: int = 600,
+        extra_hosts: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         """Run a container to completion. Always cleans up.
 
@@ -52,15 +51,20 @@ class DockerManager:
         """
         container = None
         try:
-            container = self.client.containers.run(
+            kwargs = dict(
                 image=image,
-                command=command,
                 environment=env or {},
                 volumes=volumes or {},
                 detach=True,
                 stdin_open=False,
                 tty=False,
             )
+            if command:
+                kwargs["command"] = command
+            if extra_hosts:
+                kwargs["extra_hosts"] = extra_hosts
+
+            container = self.client.containers.run(**kwargs)
             result = container.wait(timeout=timeout)
             exit_code = result["StatusCode"]
             stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
@@ -81,47 +85,3 @@ class DockerManager:
                     container.remove(force=True)
                 except Exception:
                     pass
-
-    def run_container_with_volume_io(
-        self,
-        image: str,
-        input_data: dict,
-        work_dir: Path,
-        env: dict[str, str] | None = None,
-        timeout: int = 600,
-        prompt_mount: Path | None = None,
-    ) -> dict | None:
-        """Run a container with JSON I/O via volume mount.
-
-        Writes input_data to work_dir/input.json, mounts work_dir at /work
-        and optionally mounts prompt_mount at /prompts/system.txt.
-        Reads output from work_dir/output.json.
-        """
-        work_dir.mkdir(parents=True, exist_ok=True)
-        input_path = work_dir / "input.json"
-        input_path.write_text(json.dumps(input_data, indent=2))
-
-        volumes = {
-            str(work_dir.resolve()): {"bind": "/work", "mode": "rw"},
-        }
-        if prompt_mount:
-            volumes[str(prompt_mount.resolve())] = {
-                "bind": "/prompts/system.txt",
-                "mode": "ro",
-            }
-
-        exit_code, stdout, stderr = self.run_container(
-            image=image,
-            command="",  # Uses default entrypoint
-            env=env,
-            volumes=volumes,
-            timeout=timeout,
-        )
-
-        output_path = work_dir / "output.json"
-        if output_path.exists():
-            return json.loads(output_path.read_text())
-
-        print(f"  Warning: No output.json found. Exit code: {exit_code}")
-        print(f"  stdout: {stdout[:2000]}")
-        return None

@@ -9,8 +9,53 @@ from pathlib import Path
 import yaml
 
 from .config import Config
-from .evaluator import EvaluationResult, call_claude_cli
+from .evaluator import EvaluationResult
+from .llm import complete as llm_complete
 from .skills import Skill, SkillManager, apply_trust_region
+
+
+def _lenient_json_parse(text: str) -> dict | None:
+    """Try to parse JSON that has unescaped newlines inside string values.
+
+    LLMs often produce JSON like {"key": "line1\nline2"} with literal newlines
+    instead of escaped \\n. This function fixes that by escaping newlines
+    that appear inside JSON string literals.
+    """
+    # Strategy: walk character by character, track whether we're inside a
+    # JSON string, and escape bare newlines found inside strings.
+    result = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and in_string:
+            # Escaped character — pass through both chars
+            result.append(ch)
+            if i + 1 < len(text):
+                i += 1
+                result.append(text[i])
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+        if in_string and ch == '\n':
+            result.append('\\n')
+            i += 1
+            continue
+        if in_string and ch == '\t':
+            result.append('\\t')
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
+
+    try:
+        return json.loads("".join(result))
+    except json.JSONDecodeError:
+        return None
 
 
 SKILL_FORMAT_EXAMPLE = """---
@@ -21,7 +66,7 @@ description: Systematic approach to answering research questions using available
 When researching a question, follow these steps:
 
 1. **Identify the question type**: Determine if it requires file analysis, web research, computation, or a combination
-2. **Locate resources first**: Use Glob and Read to find any attached files before asking the user
+2. **Locate resources first**: Check for any attached files in /work/ and read them using Python code
 3. **Verify your sources**: Cross-reference findings from multiple sources when possible
 
 Keep your approach systematic and always show your work.
@@ -83,14 +128,14 @@ class EvolverManager:
             f"Data:\n{data_json}"
         )
 
-        system_prompt_path = self.config.prompts_dir / "evolver_system.txt"
+        system_prompt = (self.config.prompts_dir / "evolver_system.txt").read_text()
 
         try:
-            content = call_claude_cli(
+            content = llm_complete(
                 user_content=user_content,
-                system_prompt_file=str(system_prompt_path),
-                model=self.config.model,
-                config=self.config,
+                system_prompt=system_prompt,
+                model_id=self.config.model_id,
+                api_base=self.config.api_base,
             )
         except Exception as e:
             print(f"  WARNING: Evolution failed - {e}")
@@ -116,13 +161,17 @@ class EvolverManager:
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
-            print(f"  WARNING: Failed to parse evolution JSON: {content[:500]}")
-            self._save_evolution_record(
-                epoch_dir, epoch, worst_evals,
-                skill_mgr.skills, skill_mgr.skills, [],
-                f"JSON parse error: {content[:200]}"
-            )
-            return
+            # LLMs often produce JSON with unescaped newlines in string values.
+            # Try to fix by escaping newlines inside JSON string literals.
+            data = _lenient_json_parse(content)
+            if data is None:
+                print(f"  WARNING: Failed to parse evolution JSON: {content[:500]}")
+                self._save_evolution_record(
+                    epoch_dir, epoch, worst_evals,
+                    skill_mgr.skills, skill_mgr.skills, [],
+                    f"JSON parse error: {content[:200]}"
+                )
+                return
 
         # Parse new skills
         raw_skills = data.get("skills", {})

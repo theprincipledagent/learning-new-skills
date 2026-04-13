@@ -1,11 +1,10 @@
-"""Actor container orchestration for running Claude Code on GAIA questions."""
+"""Actor container orchestration for running smolagents on GAIA questions."""
 
 import json
-import re
+import os
 import shutil
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Config
@@ -38,23 +37,24 @@ class ActorManager:
         gaia: GaiaDataset,
         skill_mgr: SkillManager,
         epoch: int,
+        rollouts_subdir: str = "rollouts",
     ) -> list[ActorResult]:
         """Run all questions in parallel, return results."""
         epoch_dir = self.config.epoch_dir(epoch)
-        rollouts_dir = self.config.rollouts_dir(epoch)
+        rollouts_dir = epoch_dir / rollouts_subdir
+        rollouts_dir.mkdir(parents=True, exist_ok=True)
 
-        # Render actor system prompt with current skills
-        system_prompt = skill_mgr.build_system_prompt(
-            self.config.prompts_dir / "actor_system.txt"
-        )
-        system_prompt_path = epoch_dir / "actor_system_prompt.txt"
-        system_prompt_path.write_text(system_prompt)
+        # Build the task prompt template with skills
+        task_prompt_template = self._build_task_prompt_template(skill_mgr)
+
+        # Save rendered template for debugging
+        (epoch_dir / "actor_task_prompt_template.txt").write_text(task_prompt_template)
 
         results: list[ActorResult] = []
         with ThreadPoolExecutor(max_workers=self.config.max_parallel_actors) as pool:
             futures = {
                 pool.submit(
-                    self._run_single, q, system_prompt_path, rollouts_dir
+                    self._run_single, q, task_prompt_template, rollouts_dir
                 ): q
                 for q in questions
             }
@@ -87,19 +87,41 @@ class ActorManager:
 
         return results
 
+    def _build_task_prompt_template(self, skill_mgr: SkillManager) -> str:
+        """Build the full task prompt with skills injected.
+
+        smolagents manages its own system prompt for tool orchestration,
+        so our skills and instructions go into the task prompt instead.
+        """
+        template = (self.config.prompts_dir / "actor_task.txt").read_text()
+        skills_block = skill_mgr._build_skills_block()
+        return template.replace("{skills_block}", skills_block)
+
     def _run_single(
         self,
         question: GaiaQuestion,
-        system_prompt_path: Path,
+        task_prompt_template: str,
         rollouts_dir: Path,
     ) -> ActorResult:
         """Run a single question in a Docker container."""
         work_dir = rollouts_dir / question.task_id
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write the question prompt to a file
-        prompt_path = work_dir / "prompt.txt"
-        prompt_path.write_text(question.question)
+        # Write the raw question (for reference)
+        (work_dir / "prompt.txt").write_text(question.question)
+
+        # Build the full task prompt: template with question filled in
+        task_prompt = task_prompt_template.replace("{question}", question.question)
+        (work_dir / "task_prompt.txt").write_text(task_prompt)
+
+        # Write container config
+        container_config = {
+            "model_id": self.config.model_id,
+            "max_steps": self.config.max_actor_turns,
+        }
+        if self.config.api_base:
+            container_config["api_base"] = self.config.api_base
+        (work_dir / "config.json").write_text(json.dumps(container_config, indent=2))
 
         # Copy attached files if present
         if question.file_path:
@@ -108,57 +130,40 @@ class ActorManager:
                 dst = work_dir / src.name
                 shutil.copy2(src, dst)
 
-        # Build env vars
-        env = {}
-        if self.config.api_key:
-            env["ANTHROPIC_API_KEY"] = self.config.api_key
-        if self.config.oauth_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = self.config.oauth_token
-
-        # Write a shell script to avoid docker-py shlex.split issues
-        script = (
-            '#!/bin/bash\n'
-            'claude -p "$(cat /work/prompt.txt)" '
-            f'--model {self.config.model} '
-            f'--verbose '
-            f'--output-format stream-json '
-            f'--append-system-prompt-file /etc/claude/system_prompt.txt '
-            f'--allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch" '
-            f'--max-turns {self.config.max_actor_turns} '
-            f'--dangerously-skip-permissions\n'
-        )
-        script_path = work_dir / "run.sh"
-        script_path.write_text(script)
-        script_path.chmod(0o755)
-
         volumes = {
             str(work_dir.resolve()): {"bind": "/work", "mode": "rw"},
-            str(system_prompt_path.resolve()): {
-                "bind": "/etc/claude/system_prompt.txt",
-                "mode": "ro",
-            },
         }
 
-        # Pass as list so docker-py doesn't shlex.split it
+        # Forward API key env vars to the container
+        env = {}
+        for key in ("EXA_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+
         exit_code, stdout, stderr = self.docker.run_container(
             image=self.config.actor_image,
-            command=["/work/run.sh"],
-            env=env,
             volumes=volumes,
+            env=env,
             timeout=self.config.actor_timeout_seconds,
         )
 
-        # Claude Code may write to stdout or stderr; combine for parsing
-        combined_output = stdout + "\n" + stderr
-        transcript_raw = combined_output
+        # Read structured output from container
+        output_path = work_dir / "output.json"
+        if output_path.exists():
+            output = json.loads(output_path.read_text())
+            final_answer = output.get("final_answer")
+            transcript_formatted = output.get("transcript", "")
+            error = output.get("error")
+            if error:
+                print(f"  Agent error for {question.task_id}: {error}")
+        else:
+            final_answer = None
+            transcript_formatted = (
+                f"No output.json. stdout: {stdout[:2000]}\nstderr: {stderr[:2000]}"
+            )
 
-        # Check for billing/auth errors in stream-json before parsing
-        error = self._check_for_error(combined_output)
-        if error:
-            raise RuntimeError(f"Claude Code error: {error}")
-
-        transcript_formatted = self._format_transcript(combined_output)
-        final_answer = self._extract_answer(combined_output)
+        transcript_raw = stdout + "\n" + stderr
         is_correct = check_answer(final_answer, question.final_answer)
 
         # Save rollout
@@ -187,92 +192,3 @@ class ActorManager:
             ground_truth=question.final_answer,
             is_correct=is_correct,
         )
-
-    def _check_for_error(self, raw_output: str) -> str | None:
-        """Check stream-json output for fatal errors (billing, auth, etc.)."""
-        for line in raw_output.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-                error = event.get("error")
-                if error and event.get("type") in ("assistant", "result"):
-                    # Extract human-readable message
-                    content = event.get("message", {}).get("content", [])
-                    if isinstance(content, list) and content:
-                        msg = content[0].get("text", error)
-                    else:
-                        msg = event.get("result", error)
-                    return f"{msg} ({error})"
-            except json.JSONDecodeError:
-                continue
-        return None
-
-    def _format_transcript(self, raw_output: str) -> str:
-        """Parse stream-json NDJSON output into a formatted transcript."""
-        lines = []
-        for line in raw_output.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                lines.append(f"[raw] {line}")
-                continue
-
-            event_type = event.get("type", "")
-            if event_type == "assistant":
-                msg = event.get("message", {})
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                lines.append(f"[assistant] {block.get('text', '')}")
-                            elif block.get("type") == "tool_use":
-                                lines.append(
-                                    f"[tool_use: {block.get('name', '')}] "
-                                    f"{json.dumps(block.get('input', {}))[:500]}"
-                                )
-                elif isinstance(content, str):
-                    lines.append(f"[assistant] {content}")
-            elif event_type == "tool_result":
-                content = event.get("content", "")
-                if isinstance(content, str):
-                    lines.append(f"[tool_result] {content[:500]}")
-            elif event_type == "result":
-                result_text = event.get("result", "")
-                if isinstance(result_text, str):
-                    lines.append(f"[result] {result_text}")
-
-        return "\n".join(lines) if lines else raw_output[:5000]
-
-    def _extract_answer(self, raw_output: str) -> str | None:
-        """Extract FINAL ANSWER from output."""
-        # Try from stream-json result events first
-        for line in reversed(raw_output.strip().split("\n")):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-                if event.get("type") == "result":
-                    text = event.get("result", "")
-                    match = re.search(
-                        r"FINAL ANSWER:\s*(.+?)(?:\n|$)", text, re.IGNORECASE
-                    )
-                    if match:
-                        return match.group(1).strip()
-            except json.JSONDecodeError:
-                pass
-
-        # Fallback: search entire output
-        match = re.search(
-            r"FINAL ANSWER:\s*(.+?)(?:\n|$)", raw_output, re.IGNORECASE
-        )
-        if match:
-            return match.group(1).strip()
-
-        return None

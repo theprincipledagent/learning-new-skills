@@ -1,14 +1,12 @@
-"""Evaluator orchestration: scores rollouts using Claude Code CLI."""
+"""Evaluator orchestration: scores rollouts using litellm."""
 
 import json
-import os
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .actor import ActorResult
 from .config import Config
+from .llm import complete as llm_complete
 from .skills import SkillManager
 
 
@@ -48,7 +46,7 @@ class EvaluatorManager:
         skill_mgr: SkillManager,
         epoch: int,
     ) -> list[EvaluationResult]:
-        """Evaluate all rollouts sequentially via Claude Code CLI."""
+        """Evaluate all rollouts sequentially via litellm."""
         epoch_dir = self.config.epoch_dir(epoch)
         skills_text = skill_mgr._build_skills_block()
 
@@ -86,7 +84,7 @@ class EvaluatorManager:
     def _evaluate_single(
         self, rollout: ActorResult, skills_text: str
     ) -> EvaluationResult:
-        """Evaluate a single rollout via Claude Code CLI."""
+        """Evaluate a single rollout via litellm."""
         transcript = rollout.transcript_formatted
         if len(transcript) > MAX_TRANSCRIPT_CHARS:
             transcript = (
@@ -109,18 +107,18 @@ class EvaluatorManager:
             f"Data:\n{data_json}"
         )
 
-        system_prompt_path = self.config.prompts_dir / "evaluator_system.txt"
+        system_prompt = (self.config.prompts_dir / "evaluator_system.txt").read_text()
 
         try:
-            content = call_claude_cli(
+            content = llm_complete(
                 user_content=user_content,
-                system_prompt_file=str(system_prompt_path),
-                model=self.config.model,
-                config=self.config,
+                system_prompt=system_prompt,
+                model_id=self.config.model_id,
+                api_base=self.config.api_base,
             )
         except Exception as e:
             print(f"    Evaluation failed: {e}")
-            return self._default_result(rollout, f"CLI error: {e}")
+            return self._default_result(rollout, f"LLM error: {e}")
 
         return self._parse_evaluation(rollout, content)
 
@@ -155,25 +153,27 @@ class EvaluatorManager:
             f"Data:\n{data_json}"
         )
 
-        system_prompt_path = self.config.prompts_dir / "evaluator_benchmark_system.txt"
+        system_prompt = (
+            self.config.prompts_dir / "evaluator_benchmark_system.txt"
+        ).read_text()
 
         try:
-            content = call_claude_cli(
+            content = llm_complete(
                 user_content=user_content,
-                system_prompt_file=str(system_prompt_path),
-                model=self.config.model,
-                config=self.config,
+                system_prompt=system_prompt,
+                model_id=self.config.model_id,
+                api_base=self.config.api_base,
             )
         except Exception as e:
             print(f"    Benchmark evaluation failed: {e}")
-            return self._default_result(rollout, f"CLI error: {e}")
+            return self._default_result(rollout, f"LLM error: {e}")
 
         return self._parse_evaluation(rollout, content)
 
     def _parse_evaluation(
         self, rollout: ActorResult, content: str
     ) -> EvaluationResult:
-        """Parse CLI output into an EvaluationResult."""
+        """Parse LLM output into an EvaluationResult."""
         content = content.strip()
         # Strip markdown fences if present
         if content.startswith("```"):
@@ -224,56 +224,3 @@ class EvaluatorManager:
             ground_truth=rollout.ground_truth,
             is_correct=rollout.is_correct,
         )
-
-
-def call_claude_cli(
-    user_content: str,
-    system_prompt_file: str,
-    model: str,
-    config: "Config",
-) -> str:
-    """Call Claude Code CLI with prompt piped via stdin. Returns the result text."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Write prompt to file
-        prompt_file = Path(tmpdir) / "prompt.txt"
-        prompt_file.write_text(user_content)
-
-        # Write a shell script to avoid escaping issues
-        script_file = Path(tmpdir) / "run.sh"
-        script_file.write_text(
-            '#!/bin/bash\n'
-            f'claude -p "$(cat {prompt_file})" '
-            f'--model {model} '
-            f'--max-turns 1 '
-            f'--output-format json '
-            f'--append-system-prompt-file {system_prompt_file} '
-            f'--dangerously-skip-permissions\n'
-        )
-        script_file.chmod(0o755)
-
-        env = dict(os.environ)
-        if config.api_key:
-            env["ANTHROPIC_API_KEY"] = config.api_key
-        if config.oauth_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = config.oauth_token
-
-        result = subprocess.run(
-            ["bash", str(script_file)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI failed (exit {result.returncode}): "
-            f"{result.stderr[:500]}"
-        )
-
-    # Parse JSON output to get the result text
-    try:
-        output = json.loads(result.stdout)
-        return output.get("result", result.stdout)
-    except json.JSONDecodeError:
-        return result.stdout

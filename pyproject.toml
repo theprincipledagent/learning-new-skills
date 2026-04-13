@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skill-rl"
-version = "0.1.0"
-description = "Reinforcement learning system for evolving Claude Code skill files"
+version = "0.2.0"
+description = "Reinforcement learning system for evolving agent skill files"
 requires-python = ">=3.11"
 dependencies = [
     "docker>=7.0",
@@ -13,6 +13,7 @@ dependencies = [
     "huggingface-hub>=0.23",
     "pyyaml>=6.0",
     "matplotlib>=3.8",
+    "litellm[google]>=1.0",
 ]
 
 [project.scripts]

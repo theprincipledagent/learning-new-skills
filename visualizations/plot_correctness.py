@@ -35,9 +35,10 @@ _grid_colors = {
 }
 
 
-def load_all_rollouts() -> dict[int, dict[str, dict]]:
+def load_all_rollouts(test: bool = False) -> dict[int, dict[str, dict]]:
     """Load all rollouts, keyed by epoch -> task_id -> rollout data."""
     all_data: dict[int, dict[str, dict]] = {}
+    subdir = "test_rollouts" if test else "rollouts"
 
     for epoch_dir in sorted(DATA_DIR.glob("epoch_*")):
         try:
@@ -45,7 +46,7 @@ def load_all_rollouts() -> dict[int, dict[str, dict]]:
         except (ValueError, IndexError):
             continue
 
-        rollouts_dir = epoch_dir / "rollouts"
+        rollouts_dir = epoch_dir / subdir
         if not rollouts_dir.exists():
             continue
 
@@ -103,7 +104,7 @@ def build_grid(all_data: dict[int, dict[str, dict]]):
     return matrix, epochs, sorted_tasks, task_questions, task_success
 
 
-def plot(matrix, epochs, tasks, task_questions, task_success, show_questions, output_path):
+def plot(matrix, epochs, tasks, task_questions, task_success, show_questions, output_path, title="Correctness Grid: Epoch vs Question"):
     """Render the grid plot."""
     plt.style.use('seaborn-v0_8-whitegrid')
 
@@ -180,7 +181,7 @@ def plot(matrix, epochs, tasks, task_questions, task_success, show_questions, ou
         color=_color_palette["text"], fontsize=12,
     )
     ax.set_title(
-        "Correctness Grid: Epoch vs Question",
+        title,
         color=_color_palette["text"], fontsize=16, weight="bold",
         pad=40,
     )
@@ -219,13 +220,18 @@ def main():
     parser.add_argument("--show", action="store_true", help="Display plot interactively")
     parser.add_argument("--questions", action="store_true",
                         help="Label y-axis with question text")
-    parser.add_argument("--out", type=str, default="correctness_grid.png",
-                        help="Output file path")
+    parser.add_argument("--test", action="store_true",
+                        help="Plot test rollouts instead of training rollouts")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output file path (default: correctness_grid.png or test_correctness_grid.png)")
     args = parser.parse_args()
 
-    all_data = load_all_rollouts()
+    label = "test" if args.test else "training"
+    output_path = args.out or ("test_correctness_grid.png" if args.test else "correctness_grid.png")
+
+    all_data = load_all_rollouts(test=args.test)
     if not all_data:
-        print("No rollout data found in data/epochs/")
+        print(f"No {label} rollout data found in data/epochs/")
         return
 
     matrix, epochs, tasks, task_questions, task_success = build_grid(all_data)
@@ -235,10 +241,11 @@ def main():
     total_correct = int(np.sum(matrix == 1))
     total_wrong = int(np.sum(matrix == 0))
     total_missing = int(np.sum(matrix == -1))
-    print(f"Loaded {n_tasks} tasks across {n_epochs} epochs")
+    print(f"Loaded {n_tasks} {label} tasks across {n_epochs} epochs")
     print(f"  Correct: {total_correct}  Wrong: {total_wrong}  Missing: {total_missing}")
 
-    fig = plot(matrix, epochs, tasks, task_questions, task_success, args.questions, args.out)
+    title = "Test Set Correctness Grid" if args.test else "Correctness Grid: Epoch vs Question"
+    fig = plot(matrix, epochs, tasks, task_questions, task_success, args.questions, output_path, title)
 
     if args.show:
         plt.show()
