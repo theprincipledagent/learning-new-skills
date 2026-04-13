@@ -13,7 +13,8 @@ Each post in the series has a corresponding **GitHub Release** that contains a p
 
 | Post | Title | Blog Post Link | Code Release |
 | :--- | :--- | :---: | :---: |
-| #1 | Why AI-as-a-Judge is Hard | [Read Post](https://theprincipledagent.com/2026/04/07/why-ai-as-a-judge-is-hard-learning-new-skills-1/) | [v1.1]
+| #2 | Locally Rational, Globally Harmful | [Read Post](https://theprincipledagent.com/2026/04/13/locally-rational-globally-harmful-learning-new-skills-2/) | [v1.2](https://github.com/theprincipledagent/learning-new-skills/releases/tag/v1.2)
+| #1 | Why AI-as-a-Judge is Hard | [Read Post](https://theprincipledagent.com/2026/04/07/why-ai-as-a-judge-is-hard-learning-new-skills-1/) | [v1.1](https://github.com/theprincipledagent/learning-new-skills/releases/tag/v1.1)
 
 ---
 
